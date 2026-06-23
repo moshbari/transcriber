@@ -4,7 +4,7 @@
   "description": "Facebook video transcription using OpenAI Whisper",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "(yt-dlp -U || true) && node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",

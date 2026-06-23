@@ -23,10 +23,32 @@ const run = (cmd, opts = {}) =>
     });
   });
 
-// Download via yt-dlp (works for FB/IG/Twitter/YouTube; blocked for TikTok on datacenter IPs)
+// Extra yt-dlp args. Login-walled sites (Instagram/Facebook) and YouTube's
+// bot checks usually need a logged-in cookie jar — set YTDLP_COOKIES_B64 (a
+// base64 of a Netscape cookies.txt exported from a logged-in browser).
+let cookiesReady = false;
+function ytdlpArgs() {
+  const args = ['--no-playlist', '--no-warnings', '--force-ipv4'];
+  if (process.env.YTDLP_COOKIES_B64) {
+    try {
+      if (!cookiesReady) {
+        fs.writeFileSync('/tmp/yt-cookies.txt', Buffer.from(process.env.YTDLP_COOKIES_B64, 'base64').toString('utf8'));
+        cookiesReady = true;
+      }
+      args.push('--cookies', '/tmp/yt-cookies.txt');
+    } catch (e) {
+      console.error('cookie write failed:', e.message);
+    }
+  }
+  return args.join(' ');
+}
+
+// Download via yt-dlp (FB/IG/Twitter/YouTube). Kept fresh by a boot-time
+// `yt-dlp -U` (see package.json) since stale extractors are the #1 cause of
+// "Failed to download video" on these sites.
 async function downloadWithYtdlp(url, audioPath) {
   try {
-    await run(`yt-dlp -x --audio-format mp3 --audio-quality 0 -o "${audioPath}" "${url}"`);
+    await run(`yt-dlp ${ytdlpArgs()} -x --audio-format mp3 --audio-quality 0 -o "${audioPath}" "${url}"`);
   } catch (err) {
     console.error('yt-dlp error:', err.message);
     throw new Error('Failed to download video');
