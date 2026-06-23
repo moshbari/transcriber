@@ -47,8 +47,14 @@ function ytdlpArgs() {
 // `yt-dlp -U` (see package.json) since stale extractors are the #1 cause of
 // "Failed to download video" on these sites.
 async function downloadWithYtdlp(url, audioPath) {
+  // -f bestaudio/best + the web_safari player client avoids YouTube's recent
+  // "Requested format is not available" (the default clients return
+  // SABR/PO-gated streams that can't be downloaded server-side, even with
+  // valid cookies). The extractor-arg is namespaced to youtube, so it's a
+  // no-op for IG/FB/Twitter, which keep the generic best-audio selection.
+  const fmt = `-f "bestaudio/best" --extractor-args "youtube:player_client=web_safari,mweb,tv"`;
   try {
-    await run(`yt-dlp ${ytdlpArgs()} -x --audio-format mp3 --audio-quality 0 -o "${audioPath}" "${url}"`);
+    await run(`yt-dlp ${ytdlpArgs()} ${fmt} -x --audio-format mp3 --audio-quality 0 -o "${audioPath}" "${url}"`);
   } catch (err) {
     console.error('yt-dlp error:', err.message);
     throw new Error('Failed to download video');
