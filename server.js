@@ -136,8 +136,9 @@ async function fetchYouTubeCaptionsWeb(url) {
   const cookie = youtubeCookieHeader();
   if (cookie) headers.Cookie = cookie;
 
-  const html = await (await fetch(`https://www.youtube.com/watch?v=${id}&hl=en`, { headers })).text();
+  const html = await (await fetch(`https://www.youtube.com/watch?v=${id}&hl=en&bpctr=9999999999&has_verified=1`, { headers })).text();
   const m = html.match(/"captionTracks":(\[.*?\])/);
+  console.log(`[capweb ${id}] html=${html.length}b cookie=${cookie ? 'yes' : 'no'} captionTracks=${!!m} consent=${/consent\.youtube|CONSENT/.test(html)} signin=${/Sign in to confirm|LOGIN_REQUIRED/.test(html)} playerResp=${html.includes('ytInitialPlayerResponse')}`);
   if (!m) return null;
   let tracks;
   try { tracks = JSON.parse(m[1]); } catch { return null; }
