@@ -52,7 +52,7 @@ async function downloadWithYtdlp(url, audioPath) {
   // SABR/PO-gated streams that can't be downloaded server-side, even with
   // valid cookies). The extractor-arg is namespaced to youtube, so it's a
   // no-op for IG/FB/Twitter, which keep the generic best-audio selection.
-  const fmt = `-f "bestaudio/best" --extractor-args "youtube:player_client=web_safari,mweb,tv"`;
+  const fmt = `-f "bestaudio/best" --extractor-args "youtube:player_client=default,web_safari,mweb,tv;formats=missing_pot"`;
   try {
     await run(`yt-dlp ${ytdlpArgs()} ${fmt} -x --audio-format mp3 --audio-quality 0 -o "${audioPath}" "${url}"`);
   } catch (err) {
