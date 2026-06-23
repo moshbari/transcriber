@@ -12,6 +12,70 @@ app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+const isTikTok = (url) => /tiktok\.com|vm\.tiktok|vt\.tiktok/i.test(url);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const run = (cmd, opts = {}) =>
+  new Promise((resolve, reject) => {
+    exec(cmd, { timeout: 300000, ...opts }, (error, stdout, stderr) => {
+      if (error) reject(new Error(stderr || error.message));
+      else resolve(stdout);
+    });
+  });
+
+// Download via yt-dlp (works for FB/IG/Twitter/YouTube; blocked for TikTok on datacenter IPs)
+async function downloadWithYtdlp(url, audioPath) {
+  try {
+    await run(`yt-dlp -x --audio-format mp3 --audio-quality 0 -o "${audioPath}" "${url}"`);
+  } catch (err) {
+    console.error('yt-dlp error:', err.message);
+    throw new Error('Failed to download video');
+  }
+}
+
+// Resolve a TikTok link to a directly-downloadable no-watermark MP4 via tikwm,
+// then pull it from TikTok's CDN (which serves cloud IPs fine) and extract audio.
+async function downloadTikTok(url, audioPath, jobId) {
+  const videoPath = `/tmp/${jobId}.mp4`;
+  let playUrl = null;
+
+  // tikwm free tier is rate-limited to 1 req/sec — retry a few times on limit
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const resp = await fetch('https://www.tikwm.com/api/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0',
+      },
+      body: `url=${encodeURIComponent(url)}&hd=1`,
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (data.code === 0 && data.data && (data.data.play || data.data.hdplay)) {
+      playUrl = data.data.hdplay || data.data.play;
+      break;
+    }
+    if (data.msg && /limit/i.test(data.msg)) {
+      await sleep(1200);
+      continue;
+    }
+    throw new Error(`TikTok resolve failed: ${data.msg || 'unknown error'}`);
+  }
+  if (!playUrl) throw new Error('TikTok resolve failed: rate limited');
+
+  // Download the MP4 from the CDN
+  const vresp = await fetch(playUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  if (!vresp.ok) throw new Error(`TikTok CDN download failed: HTTP ${vresp.status}`);
+  const buf = Buffer.from(await vresp.arrayBuffer());
+  fs.writeFileSync(videoPath, buf);
+
+  // Extract mono 16k mp3 for Whisper, then drop the video
+  try {
+    await run(`ffmpeg -y -loglevel error -i "${videoPath}" -vn -ar 16000 -ac 1 -b:a 64k "${audioPath}"`);
+  } finally {
+    if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+  }
+}
+
 // Health check
 app.get('/', (req, res) => {
   res.json({ status: 'FB Transcriber is running!' });
@@ -30,22 +94,19 @@ app.post('/transcribe', async (req, res) => {
 
   try {
     console.log('Downloading video from:', url);
-    
-    // Download and extract audio using yt-dlp
-    await new Promise((resolve, reject) => {
-      exec(
-        `yt-dlp -x --audio-format mp3 --audio-quality 0 -o "${audioPath}" "${url}"`,
-        { timeout: 300000 },
-        (error, stdout, stderr) => {
-          if (error) {
-            console.error('yt-dlp error:', stderr);
-            reject(new Error('Failed to download video'));
-          } else {
-            resolve();
-          }
-        }
-      );
-    });
+
+    // TikTok blocks yt-dlp from datacenter IPs, so resolve it via tikwm + CDN.
+    // Other platforms (FB/IG/Twitter/YouTube) stay on yt-dlp.
+    if (isTikTok(url)) {
+      try {
+        await downloadTikTok(url, audioPath, jobId);
+      } catch (ttErr) {
+        console.error('TikTok resolver failed, trying yt-dlp:', ttErr.message);
+        await downloadWithYtdlp(url, audioPath);
+      }
+    } else {
+      await downloadWithYtdlp(url, audioPath);
+    }
 
     console.log('Audio downloaded, starting transcription...');
 
