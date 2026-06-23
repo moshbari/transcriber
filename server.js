@@ -13,6 +13,7 @@ app.use(express.json());
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const isTikTok = (url) => /tiktok\.com|vm\.tiktok|vt\.tiktok/i.test(url);
+const isYouTube = (url) => /youtube\.com|youtu\.be/i.test(url);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const run = (cmd, opts = {}) =>
@@ -59,6 +60,42 @@ async function downloadWithYtdlp(url, audioPath) {
     console.error('yt-dlp error:', err.message);
     throw new Error('Failed to download video');
   }
+}
+
+// YouTube no longer lets servers DOWNLOAD audio (SABR/PO-token gated), but its
+// CAPTIONS come from a different endpoint that isn't gated — and with cookies
+// the player response (which holds the caption track) is reachable. For a
+// transcription service that's ideal: we get the existing transcript directly,
+// no audio, no Whisper. Returns { text, segments, language } or null if the
+// video has no captions (then we fall back to the audio path).
+const SUB_LANGS = process.env.SUB_LANGS || 'en.*,en,bn.*,bn,hi.*,hi';
+async function fetchYouTubeCaptions(url, jobId) {
+  const base = `/tmp/${jobId}`;
+  await run(
+    `yt-dlp ${ytdlpArgs()} --skip-download --write-subs --write-auto-subs ` +
+    `--sub-langs "${SUB_LANGS}" --sub-format json3 -o "${base}.%(ext)s" "${url}"`
+  );
+  const files = fs.readdirSync('/tmp').filter((f) => f.startsWith(jobId) && f.endsWith('.json3'));
+  if (!files.length) return null;
+  const path0 = `/tmp/${files[0]}`;
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(path0, 'utf8'));
+  } finally {
+    files.forEach((f) => { try { fs.unlinkSync(`/tmp/${f}`); } catch {} });
+  }
+  const segments = (data.events || [])
+    .filter((e) => e.segs)
+    .map((e) => ({
+      start: (e.tStartMs || 0) / 1000,
+      end: ((e.tStartMs || 0) + (e.dDurationMs || 0)) / 1000,
+      text: (e.segs || []).map((s) => s.utf8 || '').join('').replace(/\s+/g, ' ').trim(),
+    }))
+    .filter((s) => s.text);
+  if (!segments.length) return null;
+  const text = segments.map((s) => s.text).join(' ').replace(/\s+/g, ' ').trim();
+  const lang = (files[0].match(/\.([A-Za-z-]+)\.json3$/) || [])[1] || 'unknown';
+  return { text, segments, language: lang };
 }
 
 // Resolve a TikTok link to a directly-downloadable no-watermark MP4 via tikwm,
@@ -122,6 +159,21 @@ app.post('/transcribe', async (req, res) => {
 
   try {
     console.log('Downloading video from:', url);
+
+    // YouTube: grab the existing captions (no download, no Whisper). Falls
+    // through to the audio path only if the video has no captions.
+    if (isYouTube(url)) {
+      try {
+        const cap = await fetchYouTubeCaptions(url, jobId);
+        if (cap && cap.text) {
+          console.log(`YouTube captions used (${cap.language}, ${cap.segments.length} lines)`);
+          return res.json({ success: true, ...cap, source: 'youtube-captions' });
+        }
+        console.log('No YouTube captions found, falling back to audio download');
+      } catch (capErr) {
+        console.error('Caption fetch failed, trying audio:', capErr.message);
+      }
+    }
 
     // TikTok blocks yt-dlp from datacenter IPs, so resolve it via tikwm + CDN.
     // Other platforms (FB/IG/Twitter/YouTube) stay on yt-dlp.
