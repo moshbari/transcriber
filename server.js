@@ -296,6 +296,33 @@ app.post('/transcribe', async (req, res) => {
   }
 });
 
+// --- Direct audio-file transcription (mic dictation, voice memos, etc.) ---
+// Accepts an uploaded audio blob (multipart field "audio") and runs Whisper.
+// Used by UAE Prices shopping-list dictation and any other voice-to-text caller.
+const multer = require('multer');
+const audioUpload = multer({ dest: '/tmp', limits: { fileSize: 25 * 1024 * 1024 } });
+
+app.post('/transcribe-audio', audioUpload.single('audio'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No audio file uploaded (field "audio").' });
+  // Give the temp file a real extension so Whisper detects the container.
+  const ext = path.extname(req.file.originalname || '') || '.webm';
+  const audioPath = req.file.path + ext;
+  try {
+    fs.renameSync(req.file.path, audioPath);
+    const transcription = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(audioPath),
+      model: 'whisper-1',
+    });
+    fs.unlinkSync(audioPath);
+    res.json({ success: true, text: (transcription.text || '').trim() });
+  } catch (error) {
+    console.error('transcribe-audio error:', error.message);
+    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+    else if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
