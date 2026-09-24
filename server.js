@@ -205,6 +205,65 @@ async function downloadTikTok(url, audioPath, jobId) {
   }
 }
 
+
+// --- Whisper on audio of any length ---
+// Whisper takes 25MB per request. Re-encode to mono 16kHz 32kbps (~14MB an
+// hour — speech loses nothing) and, when it is still too big, cut it into
+// 20-minute pieces and stitch the text back together, shifting each piece's
+// timestamps so the segments stay on the whole recording's clock.
+const CHUNK_SECONDS = 20 * 60;
+const WHISPER_MAX_BYTES = 24 * 1024 * 1024;
+
+async function mediaDuration(file) {
+  const out = await run(`ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "${file}"`);
+  return parseFloat(out) || 0;
+}
+
+async function transcribeLongAudio(inputPath, jobId) {
+  const speech = `/tmp/${jobId}-speech.mp3`;
+  const parts = [];
+  try {
+    await run(`ffmpeg -y -loglevel error -i "${inputPath}" -vn -ar 16000 -ac 1 -b:a 32k "${speech}"`, { timeout: 900000 });
+    if (!fs.existsSync(speech) || fs.statSync(speech).size < 1000) {
+      throw new Error('No sound found in that file.');
+    }
+
+    if (fs.statSync(speech).size <= WHISPER_MAX_BYTES) {
+      parts.push({ file: speech, offset: 0 });
+    } else {
+      const total = await mediaDuration(speech);
+      for (let start = 0, i = 0; start < total; start += CHUNK_SECONDS, i++) {
+        const part = `/tmp/${jobId}-part${i}.mp3`;
+        await run(`ffmpeg -y -loglevel error -ss ${start} -t ${CHUNK_SECONDS} -i "${speech}" -c copy "${part}"`);
+        parts.push({ file: part, offset: start });
+      }
+    }
+
+    const texts = [];
+    const segments = [];
+    let language = '';
+    let duration = 0;
+    for (const { file, offset } of parts) {
+      const t = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(file),
+        model: 'whisper-1',
+        response_format: 'verbose_json',
+      });
+      texts.push((t.text || '').trim());
+      language = language || t.language || '';
+      duration = offset + (t.duration || 0);
+      for (const seg of t.segments || []) {
+        segments.push({ ...seg, start: seg.start + offset, end: seg.end + offset });
+      }
+    }
+    return { text: texts.filter(Boolean).join(' '), segments, language, duration };
+  } finally {
+    for (const f of [speech, ...parts.map((p) => p.file)]) {
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    }
+  }
+}
+
 // Health check
 app.get('/', (req, res) => {
   res.json({ status: 'FB Transcriber is running!' });
@@ -254,24 +313,8 @@ app.post('/transcribe', async (req, res) => {
 
     console.log('Audio downloaded, starting transcription...');
 
-    // Check file size (Whisper limit is 25MB)
-    const stats = fs.statSync(audioPath);
-    const fileSizeMB = stats.size / (1024 * 1024);
-    console.log(`Audio file size: ${fileSizeMB.toFixed(2)} MB`);
-
-    if (fileSizeMB > 25) {
-      fs.unlinkSync(audioPath);
-      return res.status(400).json({ error: 'Video too long. Max ~25 minutes supported.' });
-    }
-
-    // Transcribe with OpenAI Whisper
-    const transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(audioPath),
-      model: 'whisper-1',
-      response_format: 'verbose_json'
-    });
-
-    // Clean up temp file
+    // Any length now: long audio is cut into pieces instead of refused.
+    const transcription = await transcribeLongAudio(audioPath, jobId);
     fs.unlinkSync(audioPath);
 
     console.log('Transcription complete!');
@@ -320,6 +363,25 @@ app.post('/transcribe-audio', audioUpload.single('audio'), async (req, res) => {
     if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
     else if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Any audio or video file, any length (the phone's "Get Transcript" button) ---
+// Screen recordings, voice notes, podcast downloads. Video is fine: ffmpeg keeps
+// only the sound. Big limit on purpose — a 20-minute screen recording is ~300MB.
+const mediaUpload = multer({ dest: '/tmp', limits: { fileSize: 1024 * 1024 * 1024 } });
+
+app.post('/transcribe-media', mediaUpload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded (field "file").' });
+  const jobId = uuidv4();
+  try {
+    const result = await transcribeLongAudio(req.file.path, jobId);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('transcribe-media error:', error.message);
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
   }
 });
 
