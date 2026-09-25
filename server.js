@@ -14,6 +14,33 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const isTikTok = (url) => /tiktok\.com|vm\.tiktok|vt\.tiktok/i.test(url);
 const isYouTube = (url) => /youtube\.com|youtu\.be/i.test(url);
+const isMeta = (url) => /instagram\.com|instagr\.am|facebook\.com|fb\.watch|fb\.com/i.test(url);
+
+// --- Residential proxy (IPRoyal) ---
+// Data-center IPs get bot-checked / 429'd by YouTube, IG and FB. PROXY_URL is
+// the base proxy, e.g. http://user:pass_country-us@geo.iproyal.com:12321.
+// IPRoyal picks the exit IP from the password: we add a session id so one job's
+// requests share an IP (media URLs are tied to the IP that asked for them).
+//  - YouTube: a fresh IP per job (and per retry) — spreads the rate limit.
+//  - Instagram/Facebook: one IP per day, so the login cookies don't appear
+//    from a new house on every request (that trips their security checks).
+// TikTok stays off the proxy: tikwm + TikTok's CDN already work for free.
+// Only used when the caller sends the private key (see /transcribe).
+const { ProxyAgent, fetch: proxyFetch } = require('undici');
+function proxyUrl(session, lifetime) {
+  const base = process.env.PROXY_URL;
+  if (!base) return null;
+  if (!/iproyal/i.test(base)) return base;
+  const u = new URL(base);
+  u.password = `${decodeURIComponent(u.password)}_session-${session}_lifetime-${lifetime}`;
+  return u.toString();
+}
+const randomSession = () => Math.random().toString(36).slice(2, 10);
+function proxyForUrl(url) {
+  if (isYouTube(url)) return proxyUrl(randomSession(), '10m');
+  if (isMeta(url)) return proxyUrl(`meta${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`, '24h');
+  return null;
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const run = (cmd, opts = {}) =>
@@ -28,8 +55,10 @@ const run = (cmd, opts = {}) =>
 // bot checks usually need a logged-in cookie jar — set YTDLP_COOKIES_B64 (a
 // base64 of a Netscape cookies.txt exported from a logged-in browser).
 let cookiesReady = false;
-function ytdlpArgs() {
+function ytdlpArgs(url, useProxy) {
   const args = ['--no-playlist', '--no-warnings', '--force-ipv4'];
+  const proxy = useProxy && proxyForUrl(url);
+  if (proxy) args.push('--proxy', `"${proxy}"`);
   if (process.env.YTDLP_COOKIES_B64) {
     try {
       if (!cookiesReady) {
@@ -47,7 +76,7 @@ function ytdlpArgs() {
 // Download via yt-dlp (FB/IG/Twitter/YouTube). Kept fresh by a boot-time
 // `yt-dlp -U` (see package.json) since stale extractors are the #1 cause of
 // "Failed to download video" on these sites.
-async function downloadWithYtdlp(url, audioPath) {
+async function downloadWithYtdlp(url, audioPath, useProxy) {
   // -f bestaudio/best + the web_safari player client avoids YouTube's recent
   // "Requested format is not available" (the default clients return
   // SABR/PO-gated streams that can't be downloaded server-side, even with
@@ -55,7 +84,7 @@ async function downloadWithYtdlp(url, audioPath) {
   // no-op for IG/FB/Twitter, which keep the generic best-audio selection.
   const fmt = `-f "bestaudio/best" --extractor-args "youtube:player_client=default,web_safari,mweb,tv;formats=missing_pot"`;
   try {
-    await run(`yt-dlp ${ytdlpArgs()} ${fmt} -x --audio-format mp3 --audio-quality 0 -o "${audioPath}" "${url}"`);
+    await run(`yt-dlp ${ytdlpArgs(url, useProxy)} ${fmt} -x --audio-format mp3 --audio-quality 0 -o "${audioPath}" "${url}"`);
   } catch (err) {
     console.error('yt-dlp error:', err.message);
     throw new Error('Failed to download video');
@@ -69,10 +98,10 @@ async function downloadWithYtdlp(url, audioPath) {
 // no audio, no Whisper. Returns { text, segments, language } or null if the
 // video has no captions (then we fall back to the audio path).
 const SUB_LANGS = process.env.SUB_LANGS || 'en.*,en,bn.*,bn,hi.*,hi';
-async function fetchYouTubeCaptions(url, jobId) {
+async function fetchYouTubeCaptions(url, jobId, useProxy) {
   const base = `/tmp/${jobId}`;
   await run(
-    `yt-dlp ${ytdlpArgs()} --skip-download --write-subs --write-auto-subs ` +
+    `yt-dlp ${ytdlpArgs(url, useProxy)} --skip-download --write-subs --write-auto-subs ` +
     `--sub-langs "${SUB_LANGS}" --sub-format json3 -o "${base}.%(ext)s" "${url}"`
   );
   const files = fs.readdirSync('/tmp').filter((f) => f.startsWith(jobId) && f.endsWith('.json3'));
@@ -120,6 +149,56 @@ function youtubeCookieHeader() {
 function ytId(url) {
   const m = (url || '').match(/(?:v=|\/shorts\/|\/embed\/|youtu\.be\/)([A-Za-z0-9_-]{11})/);
   return m ? m[1] : null;
+}
+
+// Captions through the residential proxy, via YouTube's ANDROID player API.
+// The watch-page caption links now come back empty without a PO token, but
+// the Android client's links still serve the full track (~150-200KB of proxy
+// data a video). A 429 means that exit IP is rate-limited: retry on a new one.
+// No cookies here on purpose — a clean home IP passes on its own, and it keeps
+// the logged-in account out of it. Returns { text, segments, language } or null.
+async function fetchYouTubeCaptionsProxy(url) {
+  const id = ytId(url);
+  if (!id || !process.env.PROXY_URL) return null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const dispatcher = new ProxyAgent(proxyUrl(randomSession(), '10m'));
+    try {
+      const pr = await proxyFetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+        method: 'POST',
+        dispatcher,
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip' },
+        body: JSON.stringify({
+          context: { client: { clientName: 'ANDROID', clientVersion: '20.10.38', androidSdkVersion: 30, hl: 'en', gl: 'US' } },
+          videoId: id,
+        }),
+      });
+      const player = await pr.json().catch(() => ({}));
+      const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+      console.log(`[capproxy ${id} #${attempt}] player=${pr.status} ${player?.playabilityStatus?.status} tracks=${tracks.length}`);
+      if (pr.status === 429) continue;
+      if (!tracks.length) return null;
+      const lang = (re) => tracks.find((t) => re.test(t.languageCode || ''));
+      const track = lang(/^en/i) || lang(/^bn/i) || lang(/^hi/i) || tracks[0];
+      const cr = await proxyFetch(track.baseUrl.replace(/&fmt=\w+/, '') + '&fmt=json3', { dispatcher });
+      if (cr.status === 429) { console.log(`[capproxy ${id} #${attempt}] captions 429`); continue; }
+      const data = await cr.json().catch(() => null);
+      const segments = (data?.events || [])
+        .filter((e) => e.segs)
+        .map((e) => ({
+          start: (e.tStartMs || 0) / 1000,
+          end: ((e.tStartMs || 0) + (e.dDurationMs || 0)) / 1000,
+          text: (e.segs || []).map((s) => s.utf8 || '').join('').replace(/\s+/g, ' ').trim(),
+        }))
+        .filter((s) => s.text);
+      if (!segments.length) continue;
+      return { text: segments.map((s) => s.text).join(' ').replace(/\s+/g, ' ').trim(), segments, language: track.languageCode || 'unknown' };
+    } catch (e) {
+      console.error(`[capproxy ${id} #${attempt}] ${e.message}`);
+    } finally {
+      dispatcher.close().catch(() => {});
+    }
+  }
+  return null;
 }
 
 // Fetch the caption track straight from the watch-page HTML (the
@@ -279,15 +358,19 @@ app.post('/transcribe', async (req, res) => {
 
   const jobId = uuidv4();
   const audioPath = `/tmp/${jobId}.mp3`;
+  // The proxy is paid per GB, so it is private: only callers that send the
+  // secret PROXY_KEY get it. Public users (PullTranscript, devrant, pocket)
+  // never do, so for them nothing changes — YouTube stays on the extension.
+  const useProxy = !!(process.env.PROXY_KEY && req.get('x-proxy-key') === process.env.PROXY_KEY);
 
   try {
-    console.log('Downloading video from:', url);
+    console.log('Downloading video from:', url, useProxy ? '(proxy)' : '');
 
     // YouTube: grab the existing captions (no download, no Whisper). Falls
     // through to the audio path only if the video has no captions.
     if (isYouTube(url)) {
       try {
-        const cap = (await fetchYouTubeCaptionsWeb(url)) || (await fetchYouTubeCaptions(url, jobId));
+        const cap = (useProxy && await fetchYouTubeCaptionsProxy(url)) || (await fetchYouTubeCaptionsWeb(url)) || (await fetchYouTubeCaptions(url, jobId, useProxy));
         if (cap && cap.text) {
           console.log(`YouTube captions used (${cap.language}, ${cap.segments.length} lines)`);
           return res.json({ success: true, ...cap, source: 'youtube-captions' });
@@ -305,10 +388,10 @@ app.post('/transcribe', async (req, res) => {
         await downloadTikTok(url, audioPath, jobId);
       } catch (ttErr) {
         console.error('TikTok resolver failed, trying yt-dlp:', ttErr.message);
-        await downloadWithYtdlp(url, audioPath);
+        await downloadWithYtdlp(url, audioPath, useProxy);
       }
     } else {
-      await downloadWithYtdlp(url, audioPath);
+      await downloadWithYtdlp(url, audioPath, useProxy);
     }
 
     console.log('Audio downloaded, starting transcription...');
