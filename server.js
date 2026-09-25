@@ -25,7 +25,6 @@ const isMeta = (url) => /instagram\.com|instagr\.am|facebook\.com|fb\.watch|fb\.
 //  - Instagram/Facebook: one IP per day, so the login cookies don't appear
 //    from a new house on every request (that trips their security checks).
 // TikTok stays off the proxy: tikwm + TikTok's CDN already work for free.
-// Only used when the caller sends the private key (see /transcribe).
 const { ProxyAgent, fetch: proxyFetch } = require('undici');
 function proxyUrl(session, lifetime) {
   const base = process.env.PROXY_URL;
@@ -358,10 +357,10 @@ app.post('/transcribe', async (req, res) => {
 
   const jobId = uuidv4();
   const audioPath = `/tmp/${jobId}.mp3`;
-  // The proxy is paid per GB, so it is private: only callers that send the
-  // secret PROXY_KEY get it. Public users (PullTranscript, devrant, pocket)
-  // never do, so for them nothing changes — YouTube stays on the extension.
-  const useProxy = !!(process.env.PROXY_KEY && req.get('x-proxy-key') === process.env.PROXY_KEY);
+  // The proxy is the first try for every app on this server. If it fails
+  // (balance used up, blocked IP…) YouTube falls back to the browser
+  // extension on the app side — see `code` in the error below.
+  const useProxy = !!process.env.PROXY_URL;
 
   try {
     console.log('Downloading video from:', url, useProxy ? '(proxy)' : '');
@@ -418,7 +417,9 @@ app.post('/transcribe', async (req, res) => {
       fs.unlinkSync(audioPath);
     }
     
-    res.status(500).json({ error: error.message });
+    // Tells the apps to fall back to the YouTube Transcript extension (or ask
+    // the user to install it) instead of showing a bare error.
+    res.status(500).json({ error: error.message, ...(isYouTube(url) && { code: 'youtube_needs_extension' }) });
   }
 });
 
