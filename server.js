@@ -22,8 +22,9 @@ const isMeta = (url) => /instagram\.com|instagr\.am|facebook\.com|fb\.watch|fb\.
 // IPRoyal picks the exit IP from the password: we add a session id so one job's
 // requests share an IP (media URLs are tied to the IP that asked for them).
 //  - YouTube: a fresh IP per job (and per retry) — spreads the rate limit.
-//  - Instagram/Facebook: one IP per day, so the login cookies don't appear
+//  - Instagram/Facebook: one IP per hour, so the login cookies don't appear
 //    from a new house on every request (that trips their security checks).
+// If the proxy fails (dropped IP, balance used up), downloads retry without it.
 // TikTok stays off the proxy: tikwm + TikTok's CDN already work for free.
 const { ProxyAgent, fetch: proxyFetch } = require('undici');
 function proxyUrl(session, lifetime) {
@@ -37,7 +38,7 @@ function proxyUrl(session, lifetime) {
 const randomSession = () => Math.random().toString(36).slice(2, 10);
 function proxyForUrl(url) {
   if (isYouTube(url)) return proxyUrl(randomSession(), '10m');
-  if (isMeta(url)) return proxyUrl(`meta${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`, '24h');
+  if (isMeta(url)) return proxyUrl(`meta${new Date().toISOString().slice(0, 13).replace(/\D/g, '')}`, '1h');
   return null;
 }
 
@@ -82,11 +83,20 @@ async function downloadWithYtdlp(url, audioPath, useProxy) {
   // valid cookies). The extractor-arg is namespaced to youtube, so it's a
   // no-op for IG/FB/Twitter, which keep the generic best-audio selection.
   const fmt = `-f "bestaudio/best" --extractor-args "youtube:player_client=default,web_safari,mweb,tv;formats=missing_pot"`;
+  const attempt = (proxy) =>
+    run(`yt-dlp ${ytdlpArgs(url, proxy)} ${fmt} -x --audio-format mp3 --audio-quality 0 -o "${audioPath}" "${url}"`);
   try {
-    await run(`yt-dlp ${ytdlpArgs(url, useProxy)} ${fmt} -x --audio-format mp3 --audio-quality 0 -o "${audioPath}" "${url}"`);
+    await attempt(useProxy);
   } catch (err) {
     console.error('yt-dlp error:', err.message);
-    throw new Error('Failed to download video');
+    if (!useProxy) throw new Error('Failed to download video');
+    try {
+      console.log('Proxy download failed, retrying without the proxy');
+      await attempt(false);
+    } catch (err2) {
+      console.error('yt-dlp error (no proxy):', err2.message);
+      throw new Error('Failed to download video');
+    }
   }
 }
 
