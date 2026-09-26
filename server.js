@@ -115,6 +115,11 @@ async function fetchYouTubeCaptions(url, jobId, useProxy) {
   );
   const files = fs.readdirSync('/tmp').filter((f) => f.startsWith(jobId) && f.endsWith('.json3'));
   if (!files.length) return null;
+  // yt-dlp can save several languages. Read English first, then Bangla, then
+  // Hindi: taking files[0] meant alphabetical order, so "bn" beat "en".
+  const code = (f) => (f.match(/\.([A-Za-z-]+)\.json3$/) || [])[1] || '';
+  const pick = (re) => files.find((f) => re.test(code(f)));
+  files.unshift(files.splice(files.indexOf(pick(/^en/i) || pick(/^bn/i) || pick(/^hi/i) || files[0]), 1)[0]);
   const path0 = `/tmp/${files[0]}`;
   let data;
   try {
