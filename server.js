@@ -231,7 +231,11 @@ async function fetchYouTubeCaptionsWeb(url) {
   let tracks;
   try { tracks = JSON.parse(m[1]); } catch { return null; }
   if (!tracks.length) return null;
-  const track = tracks.find((t) => /^(en|bn|hi)/i.test(t.languageCode || '')) || tracks[0];
+  // English first, then Bangla, then Hindi. One regex for all three took the
+  // first match in YouTube's list, which is alphabetical by language name, so
+  // "Bangla" beat "English" and English videos came back in Bangla.
+  const lang = (re) => tracks.find((t) => re.test(t.languageCode || ''));
+  const track = lang(/^en/i) || lang(/^bn/i) || lang(/^hi/i) || tracks[0];
   if (!track.baseUrl) return null;
   const subUrl = track.baseUrl.replace(/&fmt=\w+/, '') + '&fmt=json3';
 
